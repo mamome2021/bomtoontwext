@@ -7,7 +7,6 @@ from pathlib import Path
 import signal
 import sys
 import traceback
-import urllib.parse
 
 import httpx
 
@@ -15,15 +14,6 @@ class ExtractorNoChapterBase(ABC):
 
     # Override this for setting extension of downloaded images
     image_extension = None
-
-    help_text_basic = '''用法：
-{0} {1}
-{0} list-comic
-    列出已購漫畫
-{0} dl [-o 下載位置] COMIC_ID CHAPTER_ID ...
-    下載漫畫。COMIC_ID為漫畫的ID，CHAPTER_ID為章節的ID。可指定多個CHAPTER_ID
-'''
-
     pool = None
 
     @abstractmethod
@@ -37,6 +27,7 @@ class ExtractorNoChapterBase(ABC):
         # Override this with ProcessPoolExecutor for multiprocessing
         self.Executor = ThreadPoolExecutor
         self.is_interrupted = False
+        self.client = httpx.Client()
 
         # 讀取登錄信息
         # Use 0 instead of empty string to avoid LocalProtocolError
@@ -83,10 +74,27 @@ class ExtractorNoChapterBase(ABC):
         self.is_interrupted = True
 
     @abstractmethod
-    def show_help(self):
-        """Show help text, should probably output
-        help_text or help_text_with_removed and format()"""
-        pass
+    def show_help(self, login, bought, search):
+        """Show help text
+
+        :param login: Instructions for login. Will not be displayed if it evaluates to False
+        :type login: str
+        :param bought: Whether to display instructions for bought comics
+        :type bought: bool
+        :param search: Whether to display instructions for searching comics
+        :type search: bool
+        """
+        text = '用法：\n'
+        if login:
+            text += f'{sys.argv[0]} login {login}\n'
+        if bought:
+            text += f'{sys.argv[0]} list-comic\n    列出已購漫畫\n'
+        if search:
+            text += f'{sys.argv[0]} search QUERY\n    搜索漫畫。QUERY為關鍵字\n'
+        text += f'''{sys.argv[0]} dl [-o 下載位置] COMIC_ID ...
+    下載漫畫。COMIC_ID為漫畫的ID。可指定多個COMIC_ID
+'''
+        print(text)
 
     def str_to_index(self, string, length):
         """Convert user input string to index of chapter list
@@ -104,14 +112,17 @@ class ExtractorNoChapterBase(ABC):
             else:
                 return int(s) - 1
 
-        if '-' in string:
-            start, end = [str_to_int(i, length) for i in string.split('-')]
-            if start > end:
-                return range(start, end - 1, -1)
+        ret = []
+        for s in string.split(','):
+            if '-' in s:
+                start, end = [str_to_int(i, length) for i in s.split('-')]
+                if start > end:
+                    ret += list(range(start, end - 1, -1))
+                else:
+                    ret += list(range(start, end + 1))
             else:
-                return range(start, end + 1)
-        else:
-            return [str_to_int(string, length)]
+                ret.append(str_to_int(s, length))
+        return ret
 
     def get_location(self):
         """Parse sys.argv and determine download location
@@ -169,7 +180,7 @@ class ExtractorNoChapterBase(ABC):
         :param idx: index (page number) of image, starts from 1
         :type idx: int
         :param image_url: url of image
-        :type image_url: str
+        :type image_url: httpx.URL
         :param decrypt_info: Information for image decryption
         :return: decrypted image
         :rtype: bytes
@@ -182,7 +193,7 @@ class ExtractorNoChapterBase(ABC):
             if self.is_interrupted:
                 raise Exception('被中斷')
             try:
-                return httpx.get(url, headers=headers, cookies=cookies)
+                return self.client.get(url, headers=headers, cookies=cookies)
             except Exception as e:
                 if i == self.config['retries'] - 1:
                     raise e
@@ -193,22 +204,29 @@ class ExtractorNoChapterBase(ABC):
             if self.is_interrupted:
                 raise Exception('被中斷')
             try:
-                return httpx.post(url, data=data, json=json, headers=headers, cookies=cookies)
+                return self.client.post(url, data=data, json=json, headers=headers, cookies=cookies)
             except Exception as e:
                 if i == self.config['retries'] - 1:
                     raise e
 
-    def download_img(self, idx, image, headers, cookies, path, decrypt_info):
+    def send_request(self, request):
+        """Wrapper of httpx.Client.send() to retry failed request"""
+        for i in range(self.config['retries']):
+            if self.is_interrupted:
+                raise Exception('被中斷')
+            try:
+                return self.client.send(request)
+            except Exception as e:
+                if i == self.config['retries'] - 1:
+                    raise e
+
+    def download_img(self, idx, image_request, path, decrypt_info):
         """Called by download_worker to download image
 
         :param idx: index (page number) of image, starts from 1
         :type idx: int
-        :param image: url of image
-        :type image: str
-        :param headers: headers used for image download
-        :type headers: dict
-        :param cookies: cookies used for image download
-        :type cookies: dict
+        :param image_request: request of image
+        :type image_request: httpx.Request
         :param path: Download location
         :type path: Path
         :param decrypt_info: Information for image decryption
@@ -219,8 +237,7 @@ class ExtractorNoChapterBase(ABC):
             if self.image_extension:
                 ext = self.image_extension
             else:
-                image_name = urllib.parse.urlparse(image).path
-                ext = Path(image_name).suffix
+                ext = Path(image_request.url.path).suffix
                 # Fix Kuaikan and Kakao extension
                 if ext == '.h' or ext == '.cef':
                     ext = Path(Path(image_name).stem).suffix
@@ -230,8 +247,8 @@ class ExtractorNoChapterBase(ABC):
             if filename.exists():
                 return
 
-            r = self.get_request(image, headers=headers, cookies=cookies)
-            content = self.decrypt_image(r.content, idx, image, decrypt_info)
+            r = self.send_request(image_request)
+            content = self.decrypt_image(r.content, idx, image_request.url, decrypt_info)
             with filename.open('wb') as f:
                 f.write(content)
         except Exception as e:
@@ -258,7 +275,7 @@ class ExtractorNoChapterBase(ABC):
         path.mkdir(parents=True, exist_ok=True)
         if not ExtractorBase.pool:
             ExtractorBase.pool = self.Executor(max_workers=self.config['threads'])
-        futures = [ExtractorBase.pool.submit(self.download_img, idx + 1, url, image_download.headers, image_download.cookies, path, image_download.decrypt_info) for idx, url in enumerate(image_download.urls)]
+        futures = [ExtractorBase.pool.submit(self.download_img, idx + 1, url, path, image_download.decrypt_info) for idx, url in enumerate(image_download.requests)]
         wait(futures)
 
     def fix_filename(self, name):
@@ -269,10 +286,8 @@ class ExtractorNoChapterBase(ABC):
         :return: valid filename
         :rtype: str
         """
-        return name.replace('<', '＜').replace('>', '＞').replace(':', '：') \
-                   .replace('"', '＂').replace('/', '⧸').replace('\\', '⧹') \
-                   .replace('|', '│').replace('?', '？').replace('*', '＊') \
-                   .replace('\t', ' ').replace('\x08', ' ').rstrip(' .')
+        table = str.maketrans('<>:"/\\|?*', '＜＞：＂⧸⧹│？＊', ''.join(map(chr,range(32))))
+        return name.translate(table).rstrip(' .')
 
     def login(self, token):
         """Write login information (token) to local session file
@@ -302,16 +317,16 @@ class ExtractorNoChapterBase(ABC):
     def getBoughtComicList(self):
         """Fetch bought comic list from website
 
-        :return: List of comic, which is (id, title)
-        :rtype: list[tuple[str, str]]
+        :return: List of comic
+        :rtype: list[Comic]
         """
         self.show_help()
         sys.exit(0)
 
     def showBoughtComicList(self):
         """Display bought comic list"""
-        for i in self.getBoughtComicList():
-            print(i[0], i[1])
+        for comic in self.getBoughtComicList():
+            print(comic.comic_id, comic.title)
 
     def draw_image(self, src, dest, sx, sy, width, height, dx, dy):
         """Draw rectangular region of src image to dest image
@@ -336,47 +351,50 @@ class ExtractorNoChapterBase(ABC):
         crop = src.crop((sx, sy, sx + width, sy + height))
         dest.paste(crop, (dx, dy))
 
-    def getTitleIndexFromChapterList(self, comic_id, chapter_id):
-        """Get title and index of chapter, by calling getChapterList()
-
-        :param comic_id: id of comic
-        :type comic_id: str
-        :param chapter_id: id of chapter
-        :type chapter_id: str
-        :return: title and index of chapter
-        :rtype: tuple[str, int]"""
-        for index, chapter in enumerate(self.getChapterList(comic_id)):
-            if chapter[0] == chapter_id:
-                return chapter[1], index
-
 class ExtractorBase(ExtractorNoChapterBase):
-    help_text_basic = '''用法：
-{0} {1}
-{0} search QUERY
-    搜索漫畫。QUERY為關鍵字
-{0} list-chapter COMIC_ID
-    列出漫畫章節。COMIC_ID為漫畫的ID
-{0} dl [-o 下載位置] COMIC_ID CHAPTER_ID ...
-    下載漫畫。COMIC_ID為漫畫的ID，CHAPTER_ID為章節的ID。可指定多個CHAPTER_ID
-{0} dl-all [-o 下載位置] COMIC_ID ...
-    下載漫畫所有章節。COMIC_ID為漫畫的ID。可指定多個COMIC_ID
-{0} dl-seq [-o 下載位置] COMIC_ID ... INDEX
-    依照章節序號下載漫畫。COMIC_ID為漫畫的ID，可指定多個COMIC_ID。INDEX為章節在list-chapter中的序號，序號前加r代表反序。也可使用-代表範圍。
-'''
-    help_text_with_bought = (help_text_basic +
-'''{0} list-comic
+
+    @abstractmethod
+    def show_help(self, login, bought, search, removed):
+        """Show help text
+
+        :param login: Instructions for login. Will not be displayed if it evaluates to False
+        :type login: str
+        :param bought: Whether to display instructions for bought comics
+        :type bought: bool
+        :param search: Whether to display instructions for searching comics
+        :type search: bool
+        :param removed: Whether to display instructions for downloading removed comics
+        :type removed: bool
+        """
+        text = '用法：\n'
+        if login:
+            text += f'{sys.argv[0]} login {login}\n'
+        if bought:
+            text += f'''{sys.argv[0]} list-comic
     列出已購漫畫
-{0} list-bought-chapter COMIC_ID
+{sys.argv[0]} list-bought-chapter COMIC_ID
     列出已購漫畫章節。COMIC_ID為漫畫的ID
-''')
-    help_text_with_removed = (help_text_with_bought +
-'''{0} dl-removed [-o 下載位置] COMIC_ID CHAPTER_ID ...
+'''
+        if search:
+            text += f'{sys.argv[0]} search QUERY\n    搜索漫畫。QUERY為關鍵字\n'
+        text += f'''{sys.argv[0]} list-chapter COMIC_ID
+    列出漫畫章節。COMIC_ID為漫畫的ID
+{sys.argv[0]} dl [-o 下載位置] COMIC_ID CHAPTER_ID ...
+    下載漫畫。COMIC_ID為漫畫的ID，CHAPTER_ID為章節的ID。可指定多個CHAPTER_ID
+{sys.argv[0]} dl-all [-o 下載位置] COMIC_ID ...
+    下載漫畫所有章節。COMIC_ID為漫畫的ID。可指定多個COMIC_ID
+{sys.argv[0]} dl-seq [-o 下載位置] COMIC_ID ... INDEX
+    依照章節序號下載漫畫。COMIC_ID為漫畫的ID，可指定多個COMIC_ID。INDEX為章節在list-bought-chapter中的序號，序號前加r代表反序。可使用-代表範圍，用,下載不連續章節。
+'''
+        if removed:
+            text += f'''{sys.argv[0]} dl-removed [-o 下載位置] COMIC_ID CHAPTER_ID ...
     下載下架漫畫。COMIC_ID為漫畫的ID，CHAPTER_ID為章節的ID。可指定多個CHAPTER_ID
-{0} dl-all-removed [-o 下載位置] COMIC_ID ...
+{sys.argv[0]} dl-all-removed [-o 下載位置] COMIC_ID ...
     下載下架漫畫所有章節。COMIC_ID為漫畫的ID。可指定多個COMIC_ID
-{0} dl-seq-removed [-o 下載位置] COMIC_ID ... INDEX
-    依照章節序號下載下架漫畫。COMIC_ID為漫畫的ID，可指定多個COMIC_ID。INDEX為章節在list-bought-chapter中的序號，序號前加r代表反序。也可使用-代表範圍。
-''')
+{sys.argv[0]} dl-seq-removed [-o 下載位置] COMIC_ID ... INDEX
+    依照章節序號下載下架漫畫。COMIC_ID為漫畫的ID，可指定多個COMIC_ID。INDEX為章節在list-bought-chapter中的序號，序號前加r代表反序。可使用-代表範圍，用,下載不連續章節。
+'''
+        print(text)
 
     def arg_parse(self):
         """Parse sys.argv and do action"""
@@ -439,7 +457,7 @@ class ExtractorBase(ExtractorNoChapterBase):
 
                 for index in self.str_to_index(sys.argv[-1], len(list(chapter_list))):
                     try:
-                        chapter_id = str(chapter_list[index][0])
+                        chapter_id = str(chapter_list[index].chapter_id)
                     except IndexError:
                         print(f'錯誤：沒有第{index + 1}章')
                         continue
@@ -479,7 +497,7 @@ class ExtractorBase(ExtractorNoChapterBase):
                     continue
                 for index in self.str_to_index(sys.argv[-1], len(list(chapter_list))):
                     try:
-                        chapter_id = str(chapter_list[index][0])
+                        chapter_id = str(chapter_list[index].chapter_id)
                     except IndexError:
                         print(f'錯誤：沒有第{index + 1}章')
                         continue
@@ -498,8 +516,8 @@ class ExtractorBase(ExtractorNoChapterBase):
 
         :param comic_id: id of comic
         :type comic_id: str
-        :return: List of chapter, which is (id, title, locked_status)
-        :rtype: list[tuple[str, str, LockedStatus]]
+        :return: List of chapter
+        :rtype: list[Chapter]
         """
         pass
 
@@ -509,11 +527,11 @@ class ExtractorBase(ExtractorNoChapterBase):
         :param comic_id: id of comic
         :type comic_id: str
         """
-        for index, i in enumerate(self.getChapterList(comic_id)):
-            if i[2] == LockedStatus.locked:
-                print('(鎖)', index + 1, i[1])
+        for index, chapter in enumerate(self.getChapterList(comic_id)):
+            if chapter.locked_status == LockedStatus.locked:
+                print('(鎖)', index + 1, chapter.title)
             else:
-                print(index + 1, i[1])
+                print(index + 1, chapter.title)
 
     @abstractmethod
     def downloadChapter(self, comic_id, chapter_id, root):
@@ -533,13 +551,13 @@ class ExtractorBase(ExtractorNoChapterBase):
 
         :param comic_id: id of comic
         :type comic_id: str
-        :return: List of chapter, which is (id, title)
-        :rtype: list[tuple[str, str]]
+        :return: List of chapter
+        :rtype: list[Chapter]
         """
         chapters = self.getChapterList(comic_id)
         ret = []
         for chapter in chapters:
-            if chapter[2] == LockedStatus.unlocked:
+            if chapter.locked_status == LockedStatus.unlocked:
                 ret.append(chapter)
         return ret
 
@@ -549,8 +567,8 @@ class ExtractorBase(ExtractorNoChapterBase):
         :param comic_id: id of comic
         :type comic_id: str
         """
-        for index, i in enumerate(self.getBoughtChapterList(comic_id)):
-            print(index + 1, i[1])
+        for index, chapter in enumerate(self.getBoughtChapterList(comic_id)):
+            print(index + 1, chapter.title)
 
     def downloadRemovedChapter(self, comic_id, chapter_id, root):
         """Fetch image list of chapter of removed comic and download
@@ -570,8 +588,8 @@ class ExtractorBase(ExtractorNoChapterBase):
 
         :param query: search keyword
         :type query: str
-        :return: List of comic, which is (id, title)
-        :rtype: list[tuple[str, str]]
+        :return: List of comic
+        :rtype: list[Comic]
         """
         self.show_help()
         sys.exit(0)
@@ -582,22 +600,42 @@ class ExtractorBase(ExtractorNoChapterBase):
         :param query: search keyword
         :type query: str
         """
-        for i in self.searchComic(query):
-            print(i[0], i[1])
+        for comic in self.searchComic(query):
+            print(comic.comic_id, comic.title)
+
+    def getTitleIndexFromChapterList(self, comic_id, chapter_id):
+        """Get title and index of chapter, by calling getChapterList()
+
+        :param comic_id: id of comic
+        :type comic_id: str
+        :param chapter_id: id of chapter
+        :type chapter_id: str
+        :return: title and index of chapter
+        :rtype: tuple[str, int]"""
+        for index, chapter in enumerate(self.getChapterList(comic_id)):
+            if chapter.chapter_id == chapter_id:
+                return chapter.title, index
 
     def downloadComic(self, comic_id, root):
         """Not used"""
         raise Exception('Not used')
 
+class Comic:
+    def __init__(self, comic_id, title):
+        self.comic_id = comic_id
+        self.title = title
+
+class Chapter:
+    def __init__(self, chapter_id, title, locked_status):
+        self.chapter_id = chapter_id
+        self.title = title
+        self.locked_status = locked_status
+
 class ImageDownload:
     """Class to pass download information to download_list()
 
-    :param urls: List of image url to download
-    :type urls: list[str]
-    :param headers: Headers used for image download
-    :type headers: dict
-    :param cookies: Cookies used for image download
-    :type cookies: dict
+    :param requests: List of image requests to download
+    :type requests: list[httpx.Request]
     :param root: root directory of download location
     :type root: str
     :param comic_title: comic title
@@ -616,9 +654,7 @@ class ImageDownload:
         :param chapter_title: chapter title
         :type chapter_title: str
         """
-        self.urls = []
-        self.headers = {}
-        self.cookies = {}
+        self.requests = []
         self.root = root
         self.comic_title = comic_title
         self.chapter_title = chapter_title
@@ -656,9 +692,8 @@ class Extractor(ExtractorBase):
             pass
 
     def show_help(self):
-        print(self.help_text_with_bought.format(sys.argv[0],
-'''login SESSION-TOKEN AUTHORIZATION
-    在網頁版登錄，填入 __Secure-next-auth.session-token 這個 cookie 和 Authorization: Bearer'''))
+        super().show_help('''SESSION-TOKEN AUTHORIZATION
+    在網頁版登錄，填入 __Secure-next-auth.session-token 這個 cookie 和 Authorization: Bearer''', True, True, False)
 
     def getChapterList(self, comic_id):
         headers = {
@@ -677,7 +712,7 @@ class Extractor(ExtractorBase):
                 locked_status = LockedStatus.free
             elif chapter['purchaseStatus']:
                 locked_status = LockedStatus.unlocked
-            ret.append((chapter['alias'], chapter['title'], locked_status))
+            ret.append(Chapter(chapter['alias'], chapter['title'], locked_status))
         return ret
 
     def downloadChapter(self, comic_id, chapter_id, root):
@@ -701,7 +736,7 @@ class Extractor(ExtractorBase):
             scramble_index = self.decrypt_scramble_index(comic_id, chapter_id, line, point)
             image_download.decrypt_info = scramble_index
         for i in j['props']['pageProps']['episodeData']['result']['images']:
-            image_download.urls.append(i['imagePath'])
+            image_download.requests.append(httpx.Request('GET', i['imagePath']))
         self.download_list(image_download)
 
     def getBoughtComicList(self):
@@ -715,20 +750,20 @@ class Extractor(ExtractorBase):
             raise Exception(j['error'])
         ret = []
         for comic in j['data']['content']:
-            ret.append((comic['alias'], comic['title'], False))
+            ret.append(Comic(comic['alias'], comic['title']))
         return ret
 
     def searchComic(self, query):
         headers = {
             'x-balcony-id': 'BOMTOON_TW'
         }
-        response = self.get_request(f'https://www.bomtoon.tw/api/balcony-api-v2/contents/search?searchText={urllib.parse.quote_plus(query)}&isIncludeAdult=true&isIncludeBl=true&isCheckDevice=true&contentsThumbnailType=MAIN', headers=headers)
+        response = self.get_request(f'https://www.bomtoon.tw/api/balcony-api-v2/search/all?searchText={urllib.parse.quote_plus(query)}&isIncludeAdult=true&page=0&size=50&isCheckDevice=true&contentsThumbnailType=VERTICAL,MAIN,SQUARE,VERTICAL_NOVELWRTIER,VERTICAL_NON_ADULT&searchMethod=input', headers=headers)
         j = response.json()
         if not 'data' in j:
             raise Exception(j['error'])
         ret = []
-        for i in j['data']:
-            ret.append((i['alias'], i['title']))
+        for comic in j['data']['contents']:
+            ret.append(Comic(comic['alias'], comic['title']))
         return ret
 
     def decrypt_scramble_index(self, comic_id, chapter_id, line, point):
