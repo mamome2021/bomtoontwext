@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, wait
-from itertools import repeat
 import multiprocessing
 from pathlib import Path
 import signal
@@ -73,9 +72,8 @@ class ExtractorNoChapterBase(ABC):
             print('收到中斷訊號，將結束程式')
         self.is_interrupted = True
 
-    @abstractmethod
-    def show_help(self, login, bought, search):
-        """Show help text
+    def create_help(self, login, bought, search):
+        """Create help text
 
         :param login: Instructions for login. Will not be displayed if it evaluates to False
         :type login: str
@@ -94,7 +92,12 @@ class ExtractorNoChapterBase(ABC):
         text += f'''{sys.argv[0]} dl [-o 下載位置] COMIC_ID ...
     下載漫畫。COMIC_ID為漫畫的ID。可指定多個COMIC_ID
 '''
-        print(text)
+        return text
+
+    @abstractmethod
+    def show_help(self):
+        """Show help text, can use create_help() to make help text"""
+        pass
 
     def str_to_index(self, string, length):
         """Convert user input string to index of chapter list
@@ -240,7 +243,7 @@ class ExtractorNoChapterBase(ABC):
                 ext = Path(image_request.url.path).suffix
                 # Fix Kuaikan and Kakao extension
                 if ext == '.h' or ext == '.cef':
-                    ext = Path(Path(image_name).stem).suffix
+                    ext = Path(Path(image_request.url.path).stem).suffix
                 if not ext:
                     ext = '.jpg'
             filename = Path(path, str(idx).zfill(3) + ext)
@@ -353,12 +356,11 @@ class ExtractorNoChapterBase(ABC):
 
 class ExtractorBase(ExtractorNoChapterBase):
 
-    @abstractmethod
-    def show_help(self, login, bought, search, removed):
-        """Show help text
+    def create_help(self, login, bought, search, removed):
+        """Create help text
 
-        :param login: Instructions for login. Will not be displayed if it evaluates to False
-        :type login: str
+        :param login: Instructions for login. Will not be displayed if it is None
+        :type login: str | None
         :param bought: Whether to display instructions for bought comics
         :type bought: bool
         :param search: Whether to display instructions for searching comics
@@ -367,7 +369,7 @@ class ExtractorBase(ExtractorNoChapterBase):
         :type removed: bool
         """
         text = '用法：\n'
-        if login:
+        if login is not None:
             text += f'{sys.argv[0]} login {login}\n'
         if bought:
             text += f'''{sys.argv[0]} list-comic
@@ -394,7 +396,7 @@ class ExtractorBase(ExtractorNoChapterBase):
 {sys.argv[0]} dl-seq-removed [-o 下載位置] COMIC_ID ... INDEX
     依照章節序號下載下架漫畫。COMIC_ID為漫畫的ID，可指定多個COMIC_ID。INDEX為章節在list-bought-chapter中的序號，序號前加r代表反序。可使用-代表範圍，用,下載不連續章節。
 '''
-        print(text)
+        return text
 
     def arg_parse(self):
         """Parse sys.argv and do action"""
@@ -479,6 +481,7 @@ class ExtractorBase(ExtractorNoChapterBase):
                 try:
                     self.downloadRemovedChapter(sys.argv[2], chapter_id, location)
                 except Exception as e:
+                    print(traceback.format_exc())
                     print(f'章節 {chapter_id} 下載失敗：{e}')
         elif sys.argv[1] == 'dl-seq-removed' or sys.argv[1] == 'dl-all-removed':
             if sys.argv[1] == 'dl-all-removed':
@@ -506,6 +509,7 @@ class ExtractorBase(ExtractorNoChapterBase):
                     try:
                         self.downloadRemovedChapter(comic, chapter_id, location)
                     except Exception as e:
+                        print(traceback.format_exc())
                         print(f'章節 {chapter_id} 下載失敗：{e}')
         else:
             self.show_help()
@@ -631,6 +635,9 @@ class Chapter:
         self.title = title
         self.locked_status = locked_status
 
+    def __lt__(self, other):
+        return self.chapter_id < other.chapter_id
+
 class ImageDownload:
     """Class to pass download information to download_list()
 
@@ -668,7 +675,6 @@ class LockedStatus:
 import base64
 from io import BytesIO
 import json
-import sys
 import urllib.parse
 
 from bs4 import BeautifulSoup
@@ -684,23 +690,30 @@ class Extractor(ExtractorBase):
 
     def __init__(self):
         super().__init__()
-        self.session = ''
-        self.authorization = ''
+        self.headers = {
+            'x-balcony-id': 'BOMTOON_TW'
+        }
         try:
-            self.session, self.authorization = self.token.splitlines()
+            session, authorization = self.token.splitlines()
+            self.headers['Authorization'] = 'Bearer ' + authorization
+            self.client.cookies.set('__Secure-next-auth.session-token', session, domain='www.bomtoon.tw')
         except:
             pass
 
     def show_help(self):
-        super().show_help('''SESSION-TOKEN AUTHORIZATION
-    在網頁版登錄，填入 __Secure-next-auth.session-token 這個 cookie 和 Authorization: Bearer''', True, True, False)
+        print(self.create_help('''SESSION-TOKEN
+    在網頁版登錄，填入 __Secure-next-auth.session-token 這個 cookie''', True, True, False))
+
+    def login(self, tokens):
+        self.client.cookies.set('__Secure-next-auth.session-token', tokens[0], domain='www.bomtoon.tw')
+        response = self.get_request('https://www.bomtoon.tw/api/auth/session')
+        j = response.json()
+        session = response.cookies['__Secure-next-auth.session-token']
+        authorization = j['user']['accessToken']['token']
+        super().login((session, authorization))
 
     def getChapterList(self, comic_id):
-        headers = {
-            'x-balcony-id': 'BOMTOON_TW',
-            'Authorization': 'Bearer ' + self.authorization
-        }
-        response = self.get_request(f'https://www.bomtoon.tw/api/balcony-api-v2/contents/{comic_id}?isNotLoginAdult=false', headers=headers)
+        response = self.get_request(f'https://www.bomtoon.tw/api/balcony-api-v2/contents/{comic_id}?isNotLoginAdult=false', headers=self.headers)
         j = response.json()
         if not 'data' in j:
             raise Exception(j['error'])
@@ -708,7 +721,7 @@ class Extractor(ExtractorBase):
         ret = []
         for chapter in chapters:
             locked_status = LockedStatus.locked
-            if chapter['possessionCoin'] == 0:
+            if chapter['possessionCoin'] == 0 or chapter['eventPossessionCoin'] == 0:
                 locked_status = LockedStatus.free
             elif chapter['purchaseStatus']:
                 locked_status = LockedStatus.unlocked
@@ -716,10 +729,7 @@ class Extractor(ExtractorBase):
         return ret
 
     def downloadChapter(self, comic_id, chapter_id, root):
-        headers = {
-            'Cookie': '__Secure-next-auth.session-token=' + self.session
-        }
-        response = self.get_request(f'https://www.bomtoon.tw/viewer/{comic_id}/{chapter_id}', headers)
+        response = self.get_request(f'https://www.bomtoon.tw/viewer/{comic_id}/{chapter_id}')
         soup = BeautifulSoup(response.text, 'html.parser')
         data = soup.select_one('#__NEXT_DATA__')
         j = json.loads(data.text)
@@ -736,15 +746,11 @@ class Extractor(ExtractorBase):
             scramble_index = self.decrypt_scramble_index(comic_id, chapter_id, line, point)
             image_download.decrypt_info = scramble_index
         for i in j['props']['pageProps']['episodeData']['result']['images']:
-            image_download.requests.append(httpx.Request('GET', i['imagePath']))
+            image_download.requests.append(self.client.build_request('GET', i['imagePath']))
         self.download_list(image_download)
 
     def getBoughtComicList(self):
-        headers = {
-            'x-balcony-id': 'BOMTOON_TW',
-            'Authorization': 'Bearer ' + self.authorization
-        }
-        response = self.get_request('https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=0&isIncludeAdult=true&isCheckDevice=false&size=20', headers=headers)
+        response = self.get_request('https://www.bomtoon.tw/api/balcony-api-v2/library?sort=CREATE&page=0&isIncludeAdult=true&isCheckDevice=false&size=20', headers=self.headers)
         j = response.json()
         if not 'data' in j:
             raise Exception(j['error'])
@@ -768,11 +774,7 @@ class Extractor(ExtractorBase):
 
     def decrypt_scramble_index(self, comic_id, chapter_id, line, point):
         data = {'line': line}
-        headers = {
-            'x-balcony-id': 'BOMTOON_TW',
-            'Authorization': 'Bearer ' + self.authorization
-        }
-        response = self.post_request(f'https://www.bomtoon.tw/api/balcony-api-v2/contents/images/{comic_id}/{chapter_id}', headers=headers, json=data)
+        response = self.post_request(f'https://www.bomtoon.tw/api/balcony-api-v2/contents/images/{comic_id}/{chapter_id}', headers=self.headers, json=data)
         j = response.json()
         if not 'data' in j:
             raise Exception(j['error'])
